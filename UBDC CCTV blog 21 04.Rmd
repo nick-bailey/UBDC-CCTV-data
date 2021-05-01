@@ -13,13 +13,13 @@ output: html_document
 # The easing of lockdown in Glasgow
 ### Nick Bailey, UBDC - `r format(Sys.Date(), "%d/%m/%Y")`
 
+The city centres of Britain's largest urban areas have been particularly badly hit by lockdown restrictions. At the end of February, footfall in the centres of London, Birmingham, Manchester and Glasgow was down more than 80% on pre-lockdown levels, according to the Centre for Cities' 'High street recovery tracker' (https://www.centreforcities.org/data/high-streets-recovery-tracker/). Spend was down by similar amounts while the numbers of people going to work in central locations was down by even more - 96% in the case of Glasgow. The impact on retail and hospitality sectors has been enormous. 
+
 On Monday 26th April, some of the lockdown restrictions were eased in Scotland. In particular, non-essential shops were allowed to re-open, and pubs and restaurants could offer food inside and alcohol outside. Similar changes had occurred in England two weeks earlier. 
 
-In Glasgow, we can measure the impact of these changes thanks to a unique partnership between the Urban Big Data Centre, Glasgow City Council and the Glasgow Centre for Population Health. As explained in an earlier blog (https://www.ubdc.ac.uk/news-media/2020/july/creating-open-data-counts-of-pedestrians-and-vehicles-using-cctv-cameras/), UBDC is using spare capacity in the Council's CCTV system to produce counts of the number of pedestrians present at a range of locations across the city. 
+In Glasgow, we can get a near-real-time picture of the impact of these changes thanks to a unique partnership between the Urban Big Data Centre, Glasgow City Council and the Glasgow Centre for Population Health. As explained in an earlier blog (https://www.ubdc.ac.uk/news-media/2020/july/creating-open-data-counts-of-pedestrians-and-vehicles-using-cctv-cameras/), UBDC is using spare capacity in the Council's CCTV system to produce counts of the number of pedestrians present at a range of locations across the city. Images are captured on a half-hourly cycle, and analysed within the Council's secure facilities.  All processing is done using open source tools so could be easily replicated by other authorities. If you'd like more information, please get in touch!
 
-These data are made publicly available on a daily basis, providing a near-real-time picture of footfall across the city (see details below). More importantly, processing is done using open source tools so could be easily replicated by other authorities. If you'd like more information, please get in touch!
-
-In the figures below, we use these data to measure average daily counts of the number of pedestrians at each location between 10am and 4pm. Figures for the most recent week (in green) are compared with the averages for the same days over the previous eight weeks (in grey). 
+The resulting data are made publicly available on a daily basis through an API (see details below). In the figures below, we use these data to examine average daily counts of the number of pedestrians at different locations across the city between 10am and 4pm. Figures for the most recent week (in green) are compared with the those for the same days over the previous 16 weeks, all covered by the lockdown (in grey). 
 
 ```{r setup, echo = FALSE}
 knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
@@ -29,10 +29,10 @@ pacman::p_load(httr, jsonlite, RCurl, vroom, lubridate, here, hms, tidyverse)
 
 ```
 
-```{r data from api, echo = FALSE}
+```{r data from api}
 
-# Set parameters for getting data from the API
-first_date <- "2021-03-01"
+# Set date parameters for data from the API
+first_date <- "2021-01-04"
 last_date <- "2021-05-02"
 
 # url with date filters
@@ -93,10 +93,9 @@ df_cctv <- df_cctv %>%
 
 # make list of valid locations and subset of city centre locations
 counts_per_day_min <- 15 
-valid_days_min <- 30
+valid_days_min <- 80
 
 location_keep <- df_cctv %>% 
-  filter(date >= (Sys.Date() - 31)) %>% 
   filter(hour(timestp_UTC) >= 8 & hour(timestp_UTC) < 18) %>% 
   group_by(location, date) %>% 
   summarise(counts_per_day = n()) %>% 
@@ -106,27 +105,31 @@ location_keep <- df_cctv %>%
   filter(valid_days >= valid_days_min) %>% 
   pull(location)
 
-location_centre <- data.frame(location_keep) %>% 
-  filter(grepl("Oswald", location_keep) |
-           grepl("George_Sq", location_keep) |
-           grepl("Sauchiehall", location_keep) |
-           grepl("Waterloo", location_keep)) %>% 
-  pull()
+# # 4 selected central locations
+# location_centre <- data.frame(location_keep) %>% 
+#   filter(grepl("Oswald", location_keep) |
+#            grepl("George_Sq", location_keep) |
+#            grepl("Sauchiehall", location_keep) |
+#            grepl("Waterloo", location_keep)) %>% 
+#   pull()
 
 ```
 
 ## City centre
-In the city centre, we can see that footfall in the week after restrictions eased was higher than all or almost all of the previous eight weeks. We are showing four locations here but a similar story is evident with all the central locations being monitored. An initial rush on the Monday was followed by a drop on the second day of re-opening before footfall picked up again. 
+In the city centre, we can see that footfall in the week after restrictions eased was higher than all or almost all of the previous eight weeks. We are showing four locations here but a similar story is evident with all the central locations being monitored. An initial rush on the Monday was followed by a bit of a lull on the Tuesday before footfall picked up again. 
 
 The one surprise is that footfall has not been as great as might have been expected, given the number of weeks for which the shops were closed. There is perhaps some hesitancy to return to the city centre and challenges in getting there, given we are still being encouraged to avoid public transport. 
 
-```{r fig centre, echo = FALSE, fig.height=3, fig.width=10}
+```{r fig centre, fig.height=5, fig.width=10}
 
 df_cctv %>% 
-  filter(date >= date("2021-03-01")) %>% 
   filter(hour(timestp_UTC) >= 10 & hour(timestp_UTC) < 16) %>% 
-  filter(location %in% location_centre) %>% 
-  filter(location_type == "City centre") %>% 
+  # filter(location %in% location_centre) %>% 
+  filter(location %in% location_keep & 
+           location_type == "City centre" &
+           !grepl("Brown_St", location) &
+           !grepl("cam2", location) &
+           !grepl("Gordon", location)) %>% 
   group_by(location, date) %>% 
   summarise(person = mean(person), 
             N = n()) %>%
@@ -152,10 +155,9 @@ df_cctv %>%
 ## Other high street locations
 In addition to the city centre, we have data for a number of 'high street' locations or secondary centres such as Byres Road, Duke Street, Maryhill Road and Victoria Road. Here there is much less evidence of a rise in footfall.  
 
-```{r fig other, echo=FALSE, fig.height=3, fig.width=10}
+```{r fig other, fig.height=3, fig.width=10}
 
 df_cctv %>% 
-  filter(date >= date("2021-03-01")) %>% 
   filter(hour(timestp_UTC) >= 10 & hour(timestp_UTC) < 16) %>% 
   filter(location %in% location_keep) %>% 
   filter(location_type == "Other centre") %>% 
@@ -186,14 +188,13 @@ One feature of the lockdown period has been the increased use of parks and opens
 
 It should be noted that the early days of easing have been marked by a drop in temperatures compared to the previous week and that might also be a factor here. But footfall is down on almost all the previous eight weeks. At last, people have other places they can be!
 
-```{r ig parks, echo=FALSE, fig.height=3, fig.width=10}
+```{r ig parks, fig.height=5, fig.width=10}
 
 df_cctv %>% 
-  filter(date >= date("2021-03-01")) %>% 
   filter(hour(timestp_UTC) >= 10 & hour(timestp_UTC) < 16) %>% 
-  filter(location %in% location_keep & 
-           location != "Glasgow_Green_Path") %>% 
-  filter(location_type == "Parks") %>% 
+  filter(location %in% location_keep) %>% 
+  filter(location_type == "Parks" &
+           !grepl("_overview", location)) %>% 
   group_by(location, date) %>% 
   summarise(person = mean(person), 
             N = n()) %>%
@@ -220,14 +221,13 @@ df_cctv %>%
 ## The riverfront
 Glasgow's riverfront has also been a popular destination over lockdown for walking, cycling or just hanging out. As with the parks, footfall has been lower this week overall. 
 
-```{r fig river, echo=FALSE, warning=FALSE, fig.height=3, fig.width=10}
+```{r fig river, fig.height=3, fig.width=10}
 
 df_cctv %>% 
-  filter(date >= date("2021-03-01")) %>% 
   filter(hour(timestp_UTC) >= 10 & hour(timestp_UTC) < 16) %>% 
-  filter(location %in% location_keep &
+  filter(location %in% location_keep) %>% 
+  filter(location_type == "River/canal" &
            !grepl("Watt", location)) %>% 
-  filter(location_type == "River/canal") %>% 
   group_by(location, date) %>% 
   summarise(person = mean(person), 
             N = n()) %>%
