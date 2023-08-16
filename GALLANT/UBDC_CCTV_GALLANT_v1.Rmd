@@ -1,0 +1,450 @@
+---
+title: "UBDC_CCTV_GALLANT_v1"
+author: "Nick Bailey"
+date: "14/08/2023"
+output:
+  html_document:
+    code_folding: hide
+---
+
+
+# UBDC CCTV data - GALLANT v1 - `r Sys.Date()`
+
+Data extraction and analysis for GALLANT case study neighbourhoods, August 2022 to July 2023, covering 14 cameras. 
+
+
+```{r setup}
+
+#knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+
+# load packages
+pacman::p_load(zoo, httr, jsonlite, curl, gt, feather, here, 
+               lubridate, ggrepel, viridis, tidyverse, readxl)
+
+```
+
+
+## Info on cameras
+Retrieve information on the camera locations and identities from spreadsheet. 
+
+```{r cameras cs}
+
+# cameras in GALLANT case study nhds - spreadsheet from Emma L.
+df_cs_cameras <- read_xlsx(here('GALLANT', 'df_cameras GALLANT WP4.xlsx'), 
+                           sheet = 'df_cameras') %>% 
+  rename(cs_nhd = `GALLANT nhd`) %>% 
+  filter(!is.na(cs_nhd)) %>% 
+  select(camera, camera_name, cs_nhd) %>% 
+  mutate(camera_name = paste0(camera_name, " (", camera, ")")) 
+
+# extract camera numbers
+cs_cameras = unique(df_cs_cameras$camera)
+
+```
+
+
+
+## Load data
+Load data from the API for the relevant cameras. 
+
+```{r data cs}
+
+# set dates - last 12 month
+first_date <- "2022-08-01"
+last_date <- "2023-07-31"
+
+
+df_cctv <- data.frame()
+
+for (i in 1:length(cs_cameras)) {
+
+  # base url with date filters
+  # - reformat dates for query
+  # - page_size set to max (1000)
+  api_url <- paste0("https://glasgow-cctv.ubdc.ac.uk/api/records/",
+                    "?date_after=", gsub("-", "", first_date),
+                    "&date_before=", gsub("-", "", last_date),
+                    "&camera_id=", as.character(cs_cameras[i]),
+                    "&format=json",
+                    "&page_size=1000")
+
+  # get first page of data from api
+  cctv <- GET(url = api_url)
+
+  # get content
+  cctv_content <- content(cctv, "text") %>%
+    gsub("<html><body><p>","",.) %>%
+    gsub("</p></body></html>","",.) %>%
+    gsub("&quot;",'\"',.)
+
+  # extract records from json
+  temp <- enframe(unlist(fromJSON(cctv_content)))
+
+  # make number of pages - n. records/1000, rounded up
+  n_pages <- temp %>%
+    filter(name == "count") %>%
+    mutate(value = trunc(as.numeric(value)/1000) + 1) %>%
+    pull(value)
+
+
+  # list of pages
+  ls_pages <- as.list(paste0(api_url, "&page=", 1:n_pages))
+
+  # adapted from:
+  # - https://www.roelpeters.be/three-ways-to-make-asynchronous-get-requests-in-r/
+  # - https://cran.r-project.org/web/packages/curl/vignettes/intro.html
+  pl <- new_pool()
+  bodies <- list()
+
+  # fn for api content
+  cb <- function(x) {
+    bodies <<- append(bodies,
+                      rawToChar(x$content)
+                      )
+  }
+
+  # create requests
+  lapply(ls_pages, function(x) { curl_fetch_multi(x, done = cb, pool = pl) })
+
+  # perform requests
+  out <- multi_run(pool = pl)
+
+  # # check returns
+  # print(out)
+
+  # convert to list of dfs
+  bodies <- lapply(bodies, function(x) {enframe(unlist(fromJSON(x)))})
+
+  # convert to single df
+  temp1 <- bind_rows(bodies, .id = "column_label") %>%
+    filter(name != "count" &                # remove lines which are not records
+             name != "next" &
+             name != "previous") %>%
+    mutate(name = gsub("results.", "", name)) %>%   # remove leading text
+    separate(name,                                  # split text from numeric
+           into = c("var", "case"),
+           sep = "(?<=[A-Za-z])(?=[0-9])"
+           ) %>%
+    mutate(case = (as.numeric(column_label)-1) * 1000 + as.numeric(case)) %>% 
+    mutate(case = case * 100 + i) %>%   # ensure no duplicates between cameras
+    select(-column_label)
+
+  df_cctv <- df_cctv %>%
+    rbind(temp1)
+
+}
+
+
+# further cleaning
+df_cctv <- df_cctv %>% 
+  pivot_wider(names_from = "var", values_from = "value") %>% 
+  mutate_at(vars(cars:buses), 
+            list(as.numeric)) %>% 
+  mutate(timestamp = as_datetime(timestamp),
+         hour = hour(timestamp),
+         date = date(timestamp)) %>% 
+  mutate(time = factor(case_when(hour >=  6 & hour < 10 ~ 1,
+                                 hour >= 10 & hour < 16 ~ 2,
+                                 hour >= 16 & hour < 18 ~ 3,
+                                 hour >= 18 & hour < 22 ~ 4,
+                                 hour >= 22 | hour < 06 ~ 5),
+                       levels = 1:5,
+                       labels = c("AM peak (6am-10am)",
+                                  "Daytime (10am-4pm)",
+                                  "PM peak (4pm-6pm)",
+                                  "Evening (6pm-10pm)",
+                                  "Night  (10pm-6am)"))) %>%
+  mutate(date2 = case_when(hour < 04 ~ (date - 1),  # midnight-3am in prev day
+                          TRUE ~ date),
+         day = wday(timestamp, week_start = 1), 
+         weekend = (day >= 6), 
+         month = month(timestamp)) %>% 
+  mutate(camera = as.numeric(camera))
+
+
+# add names and nhd
+df_cctv <- df_cctv %>% 
+  left_join(df_cs_cameras, by = 'camera')
+
+
+# for figs
+latest_date <- paste0(day(max(df_cctv$date)), "/", month(max(df_cctv$date)), 
+                         "/", year(max(df_cctv$date)))
+
+
+# col names for counts
+count_cols <- c("cars", "persons", "bicycles", "trucks", "motorcycles", "buses")
+
+
+# drop cols, reorder and tidy
+df_cctv <- df_cctv %>% 
+  select(-case, -id, -camera_ok, -model_name) %>% 
+  select(camera, cs_nhd, camera_name, 
+         timestamp, date, hour, day, 
+         everything()) %>% 
+  pivot_longer(cols = all_of(count_cols), 
+               names_to = 'object', 
+               values_to = 'count')
+
+
+# tidy up
+rm(cctv)
+rm(bodies)
+rm(out)
+rm(ls_pages)
+
+```
+
+## Hourly dataframe
+Counts are now hourly averages. Filling in gaps through rolling averages for hours either side, or weeks either side. 
+
+```{r hourly, warning=FALSE}
+
+# hourly-level dataset from original
+df_cctv_hourly <- df_cctv %>%
+  group_by(object, camera, date, hour) %>%
+  summarise(count = mean(count, na.rm = TRUE),    # counts are now hourly averages
+            N = n(), 
+            present = (n() > 0)) 
+
+
+# expand grid 
+df_cctv_hourly <- expand_grid(object = unique(df_cctv_hourly$object), 
+                            camera = unique(df_cctv_hourly$camera), 
+                            date = seq(min(df_cctv_hourly$date), max(df_cctv_hourly$date), by = "1 day"), 
+                            hour = unique(df_cctv_hourly$hour)) %>% 
+  left_join(df_cctv_hourly, by = c('object', 'camera', 'date', 'hour')) %>% 
+  mutate(day = wday(date, week_start = 1))
+
+
+# missing N/present set to zero
+df_cctv_hourly$N[is.na(df_cctv_hourly$N)] <- 0
+df_cctv_hourly$present[is.na(df_cctv_hourly$present)] <- 0
+
+
+# first and last date for each camera
+df_first_last_date <- df_cctv %>%
+  mutate(date = date(timestamp)) %>%                # put date/day back to original
+  group_by(camera) %>% 
+  summarise(date_first = min(date), 
+            date_last = max(date))
+
+
+# cut grid to first/last date for each camera
+df_cctv_hourly <- df_cctv_hourly %>% 
+  left_join(df_first_last_date, by = 'camera') %>% 
+  filter(date >= date_first & date <= date_last)
+
+
+# make rolling measures - hours either side
+df_cctv_hourly <- df_cctv_hourly %>% 
+  arrange(object, camera, date, hour) %>% 
+  group_by(object, camera) %>% 
+  mutate(count_hr3 = rollmean(count, k=3, fill = "fill", na.rm = TRUE), 
+         count_hr5 = rollmean(count, k=5, fill = "fill", na.rm = TRUE), 
+         present_hr3 = (rollmean(present, k=3, fill = "fill") > 0),
+         present_hr5 = (rollmean(present, k=5, fill = "fill") > 0))
+
+
+# make rolling measures - weeks either side
+df_cctv_hourly <- df_cctv_hourly %>% 
+  mutate(day = wday(date, week_start = 1)) %>% 
+  arrange(object, camera, day, hour, date) %>% 
+  mutate(count_wk3     = rollmean(count, k=3, fill = "fill", na.rm = TRUE), 
+         count_hr3_wk3 = rollmean(count_hr3, k=3, fill = "fill", na.rm = TRUE), 
+         count_hr5_wk5 = rollmean(count_hr5, k=5, fill = "fill", na.rm = TRUE),
+         present_wk3     = (rollmean(present, k=3, fill = "fill") > 0), 
+         present_hr3_wk3 = (rollmean(present_hr3, k=3, fill = "fill") > 0),
+         present_hr5_wk5 = (rollmean(present_hr5, k=5, fill = "fill") > 0)) %>% 
+  arrange(object, camera, date, hour)
+
+
+# make combined measure using 'best available' and associated quality measure
+df_cctv_hourly <- df_cctv_hourly %>% 
+  mutate(count_combined = case_when(!is.na(count)         ~ count, 
+                                    !is.na(count_hr3)     ~ count_hr3,
+                                    !is.na(count_hr5)     ~ count_hr5,
+                                    !is.na(count_wk3)     ~ count_wk3,
+                                    !is.na(count_hr3_wk3) ~ count_hr3_wk3,
+                                    !is.na(count_hr5_wk5) ~ count_hr5_wk5), 
+         quality_combined  = case_when(!is.na(count)      ~ 6, 
+                                    !is.na(count_hr3)     ~ 5,
+                                    !is.na(count_hr5)     ~ 4,
+                                    !is.na(count_wk3)     ~ 3,
+                                    !is.na(count_hr3_wk3) ~ 2,
+                                    !is.na(count_hr5_wk5) ~ 1, 
+                                    TRUE ~ 0))
+
+# # check on cameras
+# table(df_cctv_hourly$camera)
+
+```
+
+## Daily data frame
+Count is now daily total
+
+```{r daily}
+
+df_cctv_daily <- df_cctv_hourly %>% 
+  group_by(camera, object, date) %>% 
+  summarise(count = mean(count_combined, na.rm = TRUE) * 24,   # in case there are any missing values still
+            N = sum(N, na.rm = TRUE),
+            quality = mean(quality_combined, na.rm = TRUE)) %>% 
+  left_join(df_cs_cameras, by = 'camera')  %>% 
+  mutate(day = wday(date, week_start = 1), 
+         month = month(date), 
+         year = year(date),
+         weekend = (day >= 6)) %>% 
+  select(cs_nhd, camera, camera_name, object, date, year, month, day, weekend, count, N, quality, everything()) %>% 
+  arrange(cs_nhd, camera, camera_name, object, date)
+
+```
+
+
+## Monthly data frame
+Count is now daily average.
+
+```{r monthly}
+
+df_cctv_monthly <- df_cctv_daily %>% 
+  group_by(cs_nhd, camera, camera_name, object, weekend, year, month) %>% 
+  summarise(yrmon = as.yearmon(first(date)),
+            count = mean(count, na.rm = TRUE),
+            N_days = n(),
+            quality = mean(quality, na.rm = TRUE)) %>% 
+  arrange(cs_nhd, camera, camera_name, object, weekend, year, month)
+
+# # check on cameras
+# table(df_cctv_monthly$camera)
+
+temp <- df_cctv_monthly %>% 
+  pivot_wider(names_from = 'object', values_from = 'count')
+
+write_csv(temp, here("GALLANT", "GALLANT case study monthly counts.csv"))
+
+```
+
+
+## Coverage of cameras
+
+Shows the number of images on each day which go into the daily average. 
+
+
+```{r counts 1, fig.height=15, fig.width=10}
+
+# average quality measure - denominator is all days in range
+df_cctv_daily %>% 
+  filter(object == 'cars') %>% 
+  ggplot(aes(x = date, y = N)) +
+  geom_line() +
+  scale_x_date(breaks = 'month') +
+  theme_minimal() +
+  theme(panel.grid.minor.x = element_blank() ) +
+  facet_wrap(~ camera_name, ncol = 2) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title = 'No. of images per day')
+
+
+```
+
+Shows the number of days in each month for which camera has data. 
+
+
+```{r counts 2, fig.height=10, fig.width=10}
+
+# average quality measure - denominator is all days in range
+df_cctv_monthly %>% 
+  filter(object == 'cars') %>% 
+  ggplot(aes(x = yrmon, y = N_days)) +
+  geom_line(aes(colour = weekend), size = 1.2) +
+  scale_x_yearmon(n = 15) +
+  theme_minimal() +
+  facet_wrap(~ camera_name, ncol = 3) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title = 'No. of days with data each month')
+
+
+```
+
+## Results
+
+
+Weekday totals
+
+```{r weekday 1, fig.height=6, fig.width=10}
+
+df_cctv_monthly %>% 
+  filter(weekend == 0) %>% 
+  ggplot(aes(x = yrmon, y = count)) +
+  geom_line(aes(colour = camera_name), size = 1.2) + 
+  expand_limits(y = 0) +
+  scale_x_yearmon(n = 15) +
+  facet_wrap(~ object, scales = 'free') +
+  theme_minimal() +
+  theme(panel.grid.minor.x = element_blank() ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title = "Weekday daily average", 
+       x = 'Month',
+       y = 'Daily average count',
+       caption = "Source: UBDC CCTV data")
+
+```
+
+```{r weekend 1, fig.height=6, fig.width=10}
+
+df_cctv_monthly %>% 
+  filter(weekend == 1) %>% 
+  ggplot(aes(x = yrmon, y = count)) +
+  geom_line(aes(colour = camera_name), size = 1.2) + 
+  expand_limits(y = 0) +
+  scale_x_yearmon(n = 15) +
+  facet_wrap(~ object, scales = 'free') +
+  theme_minimal() +
+  theme(panel.grid.minor.x = element_blank() ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title = "Weekend daily average", 
+       x = 'Month',
+       y = 'Daily average count',
+       caption = "Source: UBDC CCTV data")
+
+```
+
+
+```{r weekday 2, fig.height=10, fig.width=10}
+
+df_cctv_monthly %>% 
+  filter(weekend == 0) %>% 
+  ggplot(aes(x = yrmon, y = count)) +
+  geom_line(aes(colour = object), size = 1.2) + 
+  expand_limits(y = 0) +
+  scale_x_yearmon(n = 15) +
+  facet_wrap(~ camera_name, ncol = 3, scales = 'free_y') +
+  theme_minimal() +
+  theme(panel.grid.minor.x = element_blank() ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title = "Weekday daily average", 
+       x = 'Month',
+       y = 'Daily average count',
+       caption = "Source: UBDC CCTV data")
+
+```
+
+```{r weekend 2, fig.height=10, fig.width=10}
+
+df_cctv_monthly %>% 
+  filter(weekend == 1) %>% 
+  ggplot(aes(x = yrmon, y = count)) +
+  geom_line(aes(colour = object), size = 1.2) + 
+  expand_limits(y = 0) +
+  scale_x_yearmon(n = 15) +
+  facet_wrap(~ camera_name, ncol = 3, scales = 'free_y') +
+  theme_minimal() +
+  theme(panel.grid.minor.x = element_blank() ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title = "Weekend daily average", 
+       x = 'Month',
+       y = 'Daily average count',
+       caption = "Source: UBDC CCTV data")
+
+```
